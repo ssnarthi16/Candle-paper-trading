@@ -142,11 +142,24 @@ def _to_ist_naive(series):
     return pd.to_datetime(series, utc=True).dt.tz_convert(IST).dt.tz_localize(None)
 
 
+CANDLE_CALL_GAP = 0.4            # seconds between two candle calls (Angel allows ~3 per second; raise to 0.7 if "access rate" errors show)
+_RATE_LOCK, _RATE_LAST = threading.Lock(), [0.0]
+
+
+def _rate_wait():
+    """All candle calls (any thread) share one clock, so several downloads can run side by side without breaking the limit."""
+    with _RATE_LOCK:
+        wait = _RATE_LAST[0] + CANDLE_CALL_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _RATE_LAST[0] = time.time()
+
+
 def _candles(smart, item, interval, start, end):
     params = {"exchange": item["exchange"], "symboltoken": str(item["token"]), "interval": interval,
               "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": end.strftime("%Y-%m-%d %H:%M")}
     for _ in range(4):                            # Angel limits: ~3 calls/sec and ~180/min
-        time.sleep(0.7)
+        _rate_wait()
         try:
             res = smart.getCandleData(params)
         except Exception:                         # "Access denied ... exceeding access rate" comes as an exception
@@ -412,7 +425,7 @@ def _close(state, cfg, pos, raw_px, when, reason):
     done = {k: pos[k] for k in ("symbol", "exchange", "pattern", "signal_date", "entry_time",
                                 "entry", "stop_loss", "target", "qty")}
     done.update({k: pos[k] for k in CANDLE_KEYS + ("signal_close",) if k in pos})
-    done.update({"exit_time": str(when), "exit": round(exit_px, 2), "reason": reason,
+    done.update({"exit_time": str(pd.Timestamp(when).floor("s")), "exit": round(exit_px, 2), "reason": reason,
                  "pnl": round(pnl, 2), "r_multiple": round(pnl / risk, 2) if risk > 0 else None})
     state["closed"].append(done)
     state["open"] = [p for p in state["open"] if p is not pos]
@@ -633,9 +646,12 @@ class Engine:
                 if c:
                     f = c.get("forming")
                     if live_ok and (f is None or f.get("b") != B):      # a new candle started -> begin a fresh one
-                        f = c["forming"] = {"open": q["ltp"], "high": q["ltp"], "low": q["ltp"], "b": B}
+                        if f is not None and f.get("close") is not None:
+                            c["roll"] = {"b": B, "close": f["close"]}   # last live price of the candle that just closed
+                        f = c["forming"] = {"open": q["ltp"], "high": q["ltp"], "low": q["ltp"], "close": q["ltp"], "b": B}
                     if f:
                         f["high"], f["low"] = max(f["high"], q["ltp"]), min(f["low"], q["ltp"])
+                        f["close"] = q["ltp"]
         with self.lock:
             for p in self.state["open"]:
                 q = self.quotes.get((p["exchange"], p["symbol"]))
@@ -660,6 +676,9 @@ class Engine:
                     d, f = c["done"], c.get("forming")
                     if live_ok and f:                                # running candle of your timeframe
                         o, h, l, pc = f["open"], f["high"], f["low"], float(d["close"].iat[-1])
+                        r = c.get("roll")
+                        if c.get("b") != B and r and r["b"] == B:    # new candle started, closed candle not downloaded yet
+                            pc = r["close"]
                     elif len(d) > 1:                                 # market closed -> last closed candle
                         o, h, l = (float(d[k].iat[-1]) for k in ("open", "high", "low"))
                         pc = float(d["close"].iat[-2])
@@ -696,14 +715,25 @@ class Engine:
 
         # 2) candles - only when a new candle has closed (table keeps updating while they load)
         due = [it for it in items if self._candle_due((it["exchange"], it["symbol"]), B, now, live_ok)]
-        for n, it in enumerate(due, 1):
+        if due:
+            from concurrent.futures import ThreadPoolExecutor
+            counter = [0]
+
+            def load_one(it):
+                if evt.is_set():
+                    return
+                try:
+                    self._load_candles(it, B, tf, live_ok)
+                except Exception as ex:
+                    errors.append(f"{it['symbol']}: {ex}")
+                counter[0] += 1
+                self.status = f"Loading candles {counter[0]}/{len(due)}"
+
+            self.status = f"Loading candles 0/{len(due)}"
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                list(pool.map(load_one, due))
             if evt.is_set():
                 return
-            self.status = f"Loading candles {n}/{len(due)}"
-            try:
-                self._load_candles(it, B, tf, live_ok)
-            except Exception as ex:
-                errors.append(f"{it['symbol']}: {ex}")
 
         # 3) exits (target from 1-minute candles, time exit)
         if live_ok and time.time() - self.last_exit_check >= self.EXIT_EVERY:
@@ -744,7 +774,8 @@ class Engine:
         tries = self.cache.get(key, {}).get("tries", 0) + 1
         lag = live_ok and not done.empty and done["date"].iat[-1] < B - tf and tries < 3   # Angel not published it yet
         with self.lock:
-            self.cache[key] = {"b": None if lag else B, "done": done, "forming": forming, "tries": tries if lag else 0}
+            self.cache[key] = {"b": None if lag else B, "done": done, "forming": forming, "tries": tries if lag else 0,
+                               "roll": self.cache.get(key, {}).get("roll")}
         if not lag:
             self._try_entry(it, done)
 
@@ -848,8 +879,19 @@ class Engine:
 
 
 def env_creds():
+    """Angel login saved on the SERVER (not in the browser): environment variables ANGEL_* or Streamlit secrets [angel]
+       (api_key, client_id, mpin, totp_secret). With these the app logs in by itself after any restart."""
     c = tuple(os.getenv(k, "").strip() for k in ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_MPIN", "ANGEL_TOTP_SECRET"))
-    return c if all(c) else None
+    if all(c):
+        return c
+    try:
+        a = st.secrets["angel"]
+        c = tuple(str(a.get(k, "")).strip() for k in ("api_key", "client_id", "mpin", "totp_secret"))
+        if all(c):
+            return c
+    except Exception:
+        pass
+    return None
 
 
 @st.cache_resource
@@ -931,13 +973,18 @@ def _valid_access_email(email):
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()))
 
 
+def _saved_email():
+    """Email of this visitor: session first, else the page URL (?e=...), which survives a browser refresh."""
+    return (st.session_state.get("access_email") or str(st.query_params.get("e", ""))).strip().lower()
+
+
 def access_request_page():
     st.title("🔐 Request Access")
     st.caption(
         "Administrator approval is required before using the Live Paper Trading application."
     )
 
-    saved_email = st.session_state.get("access_email", "")
+    saved_email = _saved_email()
     saved_name = st.session_state.get("access_name", "")
 
     if saved_email:
@@ -945,6 +992,7 @@ def access_request_page():
         status = str(result.get("status", "")).upper()
 
         if status == "APPROVED":
+            st.session_state["access_email"] = saved_email
             st.session_state["access_granted"] = True
             st.rerun()
         elif status == "PENDING":
@@ -987,6 +1035,7 @@ def access_request_page():
 
     st.session_state["access_name"] = name
     st.session_state["access_email"] = email
+    st.query_params["e"] = email                         # a browser refresh will not ask again
 
     check = _access_call("check_access", email=email)
     status = str(check.get("status", "NEW")).upper()
@@ -1034,15 +1083,21 @@ def access_request_page():
 
 
 def access_gate():
-    if st.session_state.get("access_granted", False):
+    ss = st.session_state
+    if ss.get("access_granted", False):
+        em = ss.get("access_email", "")
+        if em and st.query_params.get("e") != em:
+            st.query_params["e"] = em
         return True
 
-    email = st.session_state.get("access_email", "").strip().lower()
+    email = _saved_email()                                # after a refresh the session is empty, the URL still has it
 
     if email:
         result = _access_call("check_access", email=email)
         if str(result.get("status", "")).upper() == "APPROVED":
-            st.session_state["access_granted"] = True
+            ss["access_email"] = email
+            ss["access_granted"] = True
+            st.query_params["e"] = email
             return True
 
     access_request_page()
@@ -1084,6 +1139,7 @@ def login_page():
                            client_id.strip().upper())
     st.session_state.smart = smart
     st.session_state.client_id = client_id.strip().upper()
+    st.session_state.pop("no_autologin", None)
     st.rerun()
 
 
@@ -1128,8 +1184,8 @@ def _frames():
     if not closed_df.empty:
         old_pat = closed_df["pattern"] if "pattern" in closed_df.columns else [None] * len(closed_df)
         closed_df["pattern"] = [classify_candles(r) or p for r, p in zip(closed_df.to_dict("records"), old_pat)]
-        order = ["symbol", "exchange", "signal_date", "signal_close", *CANDLE_KEYS, "pattern", "entry_time", "entry",
-                 "exit_time", "exit", "reason", "pnl"]
+        order = ["symbol", "exchange", "signal_date", "signal_close", *CANDLE_KEYS, "pattern", "entry_time", "entry", "qty",
+                 "exit_time", "exit", "reason", "pnl", "r_multiple"]
         closed_df = closed_df[[c for c in order if c in closed_df.columns]].rename(
             columns={"signal_date": "signal_candle_start", "signal_close": "signal_candle_close"})
         closed_df["pnl_%"] = ((closed_df["exit"] / closed_df["entry"] - 1) * 100).round(2)
@@ -1152,6 +1208,9 @@ def _csv_button(label, df, name, key):
 def live_top(exchange, tf_label):
     """Status line + metrics + 1. Monitoring (live price every second)."""
     snap, state, cfg, open_df, closed_df = _frames()
+    if snap["running"]:                                   # after a refresh the sidebar boxes are empty - show the real run
+        exchange = snap["exchange"]
+        tf_label = next((k for k, v in TIMEFRAMES.items() if v[1] == cfg.tf_min), tf_label)
     now = now_ist()
     hrs = "9:00-23:30" if exchange == "MCX" else "9:15-15:30"
     mkt = (f"{exchange} market OPEN" if market_open(now, exchange) else
@@ -1224,7 +1283,8 @@ def live_bottom():
     _csv_button("Download live positions CSV", open_df[cols] if not open_df.empty else open_df, "live_positions", "dl_open")
 
     st.subheader("4. Closed trades (exit aanadhu)")
-    show = ["symbol", "exchange", "pattern", "entry_time", "entry", "exit_time", "exit", "reason", "pnl", "pnl_%"]
+    show = ["symbol", "exchange", "pattern", "entry_time", "entry", "qty", "exit_time", "exit", "reason", "pnl", "pnl_%",
+            "r_multiple"]
     if closed_df.empty:
         st.write("Closed trades illa.")
     else:
@@ -1265,8 +1325,11 @@ def main_page():
         st.write(f"Connected: **{ss.client_id}**")
         if st.button("Logout"):
             engine.stop()
+            engine.smart = engine.creds = None
+            engine.client_id = ""
             for k in ("smart", "client_id"):
                 ss.pop(k, None)
+            ss["no_autologin"] = True                    # do not auto-login again until you connect yourself
             st.rerun()
 
         st.header("Controls")
@@ -1397,9 +1460,26 @@ if not access_gate():
 # Existing paper-trading startup logic.
 _eng = get_engine()
 
-if "smart" not in st.session_state and _eng.running and _eng.smart is not None:
-    st.session_state.smart = _eng.smart
-    st.session_state.client_id = _eng.client_id or "running"
+_ss = st.session_state
+if _eng.smart is not None and not _eng.running and _eng.creds and time.time() - _eng.login_time > 8 * 3600:
+    _sm, _ = angel_login(*_eng.creds)                    # old session of a stopped engine -> fresh one
+    if _sm is not None:
+        _eng.smart, _eng.login_time = _sm, time.time()
+
+if "smart" not in _ss and _eng.smart is not None:        # the server is already logged in -> no login page after a refresh
+    _ss.smart = _eng.smart
+    _ss.client_id = _eng.client_id or "connected"
+
+if "smart" not in _ss and not _ss.get("no_autologin"):   # login saved on the server (ANGEL_* env / secrets [angel])
+    _creds = env_creds()
+    if _creds:
+        with st.spinner("Angel One login..."):
+            _sm, _err = angel_login(*_creds)
+        if _sm is not None:
+            _eng.set_login(_sm, _creds, _creds[1].strip().upper())
+            _ss.smart, _ss.client_id = _sm, _creds[1].strip().upper()
+        else:
+            st.warning(f"Auto login failed: {_err}")
 
 if "smart" not in st.session_state:
     login_page()
