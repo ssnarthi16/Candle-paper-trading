@@ -10,9 +10,9 @@ from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
-import re
 import requests
 import streamlit as st
+import re
 from datetime import datetime
 
 IST = "Asia/Kolkata"
@@ -696,8 +696,14 @@ class Engine:
                 save_state(self.state)
             self.last_exit_check = time.time()
 
-        # 3b) signals that found all positions full are entered now (oldest first) if a position has exited
-        self._fill_waiting()
+        # 3b) no waiting queue any more: a signal that finds all positions full is simply SKIPPED.
+        #     Leftover "waiting" rows from an old saved state are dropped here.
+        with self.lock:
+            if self.state.get("waiting"):
+                for w in self.state["waiting"]:
+                    self._set_signal_status(w["exchange"], w["symbol"], w["candle"], "SKIPPED (positions were full)")
+                self.state["waiting"] = []
+                save_state(self.state)
 
         # 4) final table
         self._build_rows(errors, B, tf, live_ok, final=True)
@@ -740,19 +746,6 @@ class Engine:
         add_log(state, now, f"SKIPPED {rec['symbol']}: {why}  ({rec['pattern']})")
         save_state(state)
 
-    def _queue(self, it, rec, now, key, why):
-        """(lock held) all positions are full -> the signal WAITS; it enters when a position exits."""
-        state = self.state
-        state["handled"] = (state["handled"] + [key])[-2000:]
-        rec["status"] = f"WAITING ({why})"
-        state["waiting"].append({"symbol": it["symbol"], "tradingsymbol": it["tradingsymbol"], "token": it["token"],
-                                 "exchange": it["exchange"], "lot": it.get("lot", 1), "pattern": rec["pattern"],
-                                 "candle": rec["candle"], "queued": str(now.floor("s")),
-                                 **{k: rec[k] for k in CANDLE_KEYS}})
-        state["signals"] = (state["signals"] + [rec])[-200:]
-        add_log(state, now, f"WAITING {rec['symbol']}: {why}  ({rec['pattern']}) - enters when a position exits")
-        save_state(state)
-
     def _enter(self, it, rec, ctime, price, now, from_queue=False):
         """(lock held) size the position and open it at the live price."""
         cfg, state = self.cfg, self.state
@@ -788,57 +781,10 @@ class Engine:
             state["signals"] = (state["signals"] + [rec])[-200:]
         save_state(state)
 
-    def _fill_waiting(self):
-        """Waiting signals enter (oldest first) as soon as a position exits.
-           A waiting signal expires at the entry cut-off (15:15 / MCX 23:15) or the next day."""
-        cfg = self.cfg
-        now = now_ist()
-        with self.lock:
-            keep = []
-            for w in self.state["waiting"]:
-                late = (not self.ignore) and now.time() >= exit_time(w["exchange"])
-                if pd.Timestamp(w["queued"]).date() != now.date() or late:
-                    self._set_signal_status(w["exchange"], w["symbol"], w["candle"], "EXPIRED (no free slot in time)")
-                    add_log(self.state, now, f"EXPIRED {w['symbol']}: no free position before the entry cut-off ({w['pattern']})")
-                else:
-                    keep.append(w)
-            if len(keep) != len(self.state["waiting"]):
-                self.state["waiting"] = keep
-                save_state(self.state)
-        while True:
-            now = now_ist()
-            with self.lock:
-                if not self.state["waiting"] or len(self.state["open"]) >= cfg.max_open:
-                    return
-                w = self.state["waiting"][0]
-            if not (self.ignore or market_open(now, w["exchange"])):
-                return
-            price = fetch_ltp(self.smart, w)
-            if not price:
-                q = self.quotes.get((w["exchange"], w["symbol"]))
-                price = q["ltp"] if q else None
-            if not price:
-                return                                              # try again next cycle
-            with self.lock:
-                state = self.state
-                if not any(x is w for x in state["waiting"]):
-                    continue
-                state["waiting"] = [x for x in state["waiting"] if x is not w]
-                if len(state["open"]) >= cfg.max_open:
-                    state["waiting"].insert(0, w)
-                    return
-                if any(p["exchange"] == w["exchange"] and p["symbol"] == w["symbol"] for p in state["open"]):
-                    self._set_signal_status(w["exchange"], w["symbol"], w["candle"], "SKIPPED (already in position)")
-                    add_log(state, now, f"SKIPPED {w['symbol']}: already in position ({w['pattern']})")
-                    save_state(state)
-                    continue
-                rec = {"time": w["queued"], "symbol": w["symbol"], "exchange": w["exchange"], "pattern": w["pattern"],
-                       "candle": w["candle"], **{k: w[k] for k in CANDLE_KEYS}, "status": "WAITING"}
-                self._enter(w, rec, pd.Timestamp(w["candle"]), price, now, from_queue=True)
-
     def _try_entry(self, it, done):
         """Last COMPLETED candle shows a pattern -> entry at the LIVE price.
-           All positions full -> the signal WAITS. Other blockers -> SKIPPED with the reason."""
+           All positions full (or any other blocker) -> SKIPPED with the reason, nothing is queued.
+           When a position exits, the next FRESH signal that appears takes the free slot."""
         cfg, smart = self.cfg, self.smart
         now = now_ist()
         ex, sym = it["exchange"], it["symbol"]
@@ -871,17 +817,12 @@ class Engine:
                 return "skip", f"no new entries after {exit_time(ex):%H:%M}"
             if any(p["exchange"] == ex and p["symbol"] == sym for p in st_["open"]):
                 return "skip", "already in position"
-            if any(w["exchange"] == ex and w["symbol"] == sym for w in st_["waiting"]):
-                return "skip", "already waiting"
-            if len(st_["open"]) >= cfg.max_open or st_["waiting"]:       # queue is first come, first served
-                return "full", f"positions full {len(st_['open'])}/{cfg.max_open}"
+            if len(st_["open"]) >= cfg.max_open:
+                return "skip", f"positions full {len(st_['open'])}/{cfg.max_open}"
             return None
 
         def handle(b):
-            if b[0] == "full":
-                self._queue(it, rec, now, key, b[1])
-            else:
-                self._skip(rec, now, key, b[1])
+            self._skip(rec, now, key, b[1])
 
         with self.lock:
             b = blocked()
@@ -1231,9 +1172,6 @@ def render_live(exchange, tf_label):
     csv_button("Download monitoring CSV", mon_df, "monitoring", "dl_monitor")
 
     st.subheader("2. Signals")
-    if state.get("waiting"):
-        st.caption(f"{len(state['waiting'])} signal(s) WAITING for a free position (enter when a position exits): "
-                   + ", ".join(w["symbol"] for w in state["waiting"]))
     sig_df = pd.DataFrame(state["signals"])
     if sig_df.empty:
         st.write("Signals illa (candle mudiyum bodhu pattern vandha inge varum).")
@@ -1431,4 +1369,3 @@ if "smart" not in st.session_state:
     login_page()
 else:
     main_page()
-
