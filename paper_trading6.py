@@ -352,8 +352,12 @@ def to_item(row, exchange):
 # ============================== STATE ==============================
 def load_state(path=STATE_FILE):
     s = json.load(open(path)) if os.path.exists(path) else {}
-    for k in ("open", "closed", "handled", "log", "signals", "waiting"):
+    for k in ("open", "closed", "handled", "log", "signals"):
         s.setdefault(k, [])
+    s.pop("waiting", None)                              # old versions had a waiting queue - gone now
+    for g in s["signals"]:
+        if str(g.get("status", "")).startswith(("WAITING", "EXPIRED")):
+            g["status"] = "SKIPPED (positions were full)"
     return s
 
 
@@ -429,7 +433,7 @@ def check_exits(state, cfg, now, bars_fn, ignore_hours=False):
         if hit:
             _close(state, cfg, pos, hit[0], hit[1], hit[2])
             continue
-        pos["last_price"] = float(bars["close"].iloc[-1])
+        pos.setdefault("last_price", float(bars["close"].iloc[-1]))      # live price comes from the quote thread
         pos["last_checked"] = str(bars.index[-1])
         held = int(np.busday_count(pos["entry_time"][:10], str(now.date()))) + 1
         if held >= cfg.max_hold and (ignore_hours or now.time() >= exit_time(pos["exchange"])):
@@ -457,11 +461,13 @@ class Engine:
        - entries / exits happen here; the page only displays a snapshot."""
     GRACE = 4            # seconds to wait after a candle closes before asking Angel for it
     EXIT_EVERY = 15      # seconds between target / SL checks
+    QUOTE_EVERY = 1.0    # seconds between live price updates (every table that shows a price)
 
     def __init__(self):
         self.lock = threading.RLock()
         self.thread = None
         self.stop_evt = threading.Event()
+        self.qthread = None
         self.state = load_state()
         self.smart = self.cfg = None
         self.creds, self.client_id, self.login_time = None, "", 0.0   # kept in memory only (for the daily re-login)
@@ -469,7 +475,8 @@ class Engine:
         self._clear_runtime()
 
     def _clear_runtime(self):
-        self.cache, self.quotes, self.rows, self.errors = {}, {}, [], []
+        self.cache, self.quotes, self.rows = {}, {}, []
+        self.quote_errors, self.cycle_errors = [], []
         self.status, self.last_update, self.last_exit_check = "", None, 0.0
 
     @property
@@ -523,15 +530,17 @@ class Engine:
             self.status = "Starting..."
             self.stop_evt = threading.Event()
             self.thread = threading.Thread(target=self._loop, args=(self.stop_evt,), daemon=True)
+            self.qthread = threading.Thread(target=self._quote_loop, args=(self.stop_evt,), daemon=True)
             self.thread.start()
+            self.qthread.start()
         self._save_run_config(True)
 
     def stop(self):
         self.stop_evt.set()
-        t = self.thread
-        if t is not None and t.is_alive() and t is not threading.current_thread():
-            t.join(timeout=2)
-        self.thread = None
+        for t in (self.thread, self.qthread):
+            if t is not None and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=2)
+        self.thread = self.qthread = None
         self.status = "Stopped"
         self._save_run_config(False)
 
@@ -558,7 +567,8 @@ class Engine:
 
     def snapshot(self):
         with self.lock:
-            return {"state": copy.deepcopy(self.state), "rows": list(self.rows), "errors": list(self.errors),
+            return {"state": copy.deepcopy(self.state), "rows": list(self.rows),
+                    "errors": list(self.quote_errors) + list(self.cycle_errors),
                     "status": self.status, "last_update": self.last_update, "running": self.running,
                     "cfg": self.cfg, "exchange": self.exchange}
 
@@ -570,8 +580,29 @@ class Engine:
                 self._cycle(evt)
             except Exception as ex:
                 with self.lock:
-                    self.errors = [f"engine error: {ex}"]
+                    self.cycle_errors = [f"engine error: {ex}"]
             evt.wait(max(1.0, 3.0 - (time.time() - t0)))
+
+    def _quote_loop(self, evt):
+        """Own thread: live prices every second (ltp, running candle high/low, open positions' price + P&L).
+           It never waits for candle downloads or exit checks, so prices stay live all the time."""
+        while not evt.is_set():
+            t0 = time.time()
+            try:
+                cfg, now = self.cfg, now_ist()
+                live_ok = self.ignore or market_open(now, self.exchange)
+                B = candle_boundary(now, self.exchange, cfg.tf_min)
+                errs = []
+                self._refresh_quotes(self.items, live_ok, errs, evt, B)
+                if evt.is_set():
+                    return
+                with self.lock:
+                    self.quote_errors = errs
+                self._build_rows(None, B, pd.Timedelta(minutes=cfg.tf_min), live_ok, final=False, persist=False)
+            except Exception as ex:
+                with self.lock:
+                    self.quote_errors = [f"price error: {ex}"]
+            evt.wait(max(0.2, self.QUOTE_EVERY - (time.time() - t0)))
 
     def _candle_due(self, key, B, now, live_ok):
         c = self.cache.get(key)
@@ -611,7 +642,7 @@ class Engine:
                 if q:
                     p["last_price"] = q["ltp"]
 
-    def _build_rows(self, errors, B, tf, live_ok, final=True):
+    def _build_rows(self, errors, B, tf, live_ok, final=True, persist=True):
         cfg = self.cfg
         with self.lock:
             open_keys = {(p["exchange"], p["symbol"]) for p in self.state["open"]}
@@ -640,11 +671,14 @@ class Engine:
                 if c and c.get("done") is not None:
                     row["pattern_outlook"] = predict_patterns(c["done"], c.get("forming"), q["ltp"] if q else None, cfg)
                 rows.append(row)
-            self.rows, self.errors, self.last_update = rows, list(errors), now_ist()
+            self.rows, self.last_update = rows, now_ist()
+            if errors is not None:
+                self.cycle_errors = list(errors)
             if final:
                 self.status = ("Waiting for the next candle (" + f"{(B + tf):%H:%M}" + ")" if live_ok else
                                "Market closed - prices only, no entry / exit")
-            save_state(self.state)
+            if persist:
+                save_state(self.state)
 
     def _cycle(self, evt):
         if self.creds and time.time() - self.login_time > 8 * 3600:       # Angel session is valid ~1 day
@@ -658,12 +692,7 @@ class Engine:
         B = candle_boundary(now, exch, cfg.tf_min)
         errors = []
 
-        # 1) live prices FIRST - one call, the monitoring table fills up within a second or two
-        self.status = "Live prices..."
-        self._refresh_quotes(items, live_ok, errors, evt, B)
-        if evt.is_set():
-            return
-        self._build_rows(errors, B, tf, live_ok, final=False)
+        # 1) live prices run in their own thread (_quote_loop, every second) - nothing to do here
 
         # 2) candles - only when a new candle has closed (table keeps updating while they load)
         due = [it for it in items if self._candle_due((it["exchange"], it["symbol"]), B, now, live_ok)]
@@ -675,8 +704,6 @@ class Engine:
                 self._load_candles(it, B, tf, live_ok)
             except Exception as ex:
                 errors.append(f"{it['symbol']}: {ex}")
-            if n % 5 == 0:
-                self._build_rows(errors, B, tf, live_ok, final=False)
 
         # 3) exits (target from 1-minute candles, time exit)
         if live_ok and time.time() - self.last_exit_check >= self.EXIT_EVERY:
@@ -695,15 +722,6 @@ class Engine:
                 check_exits(self.state, cfg, now_ist(), lambda it, since: bars_map.get((it["exchange"], it["symbol"])), self.ignore)
                 save_state(self.state)
             self.last_exit_check = time.time()
-
-        # 3b) no waiting queue any more: a signal that finds all positions full is simply SKIPPED.
-        #     Leftover "waiting" rows from an old saved state are dropped here.
-        with self.lock:
-            if self.state.get("waiting"):
-                for w in self.state["waiting"]:
-                    self._set_signal_status(w["exchange"], w["symbol"], w["candle"], "SKIPPED (positions were full)")
-                self.state["waiting"] = []
-                save_state(self.state)
 
         # 4) final table
         self._build_rows(errors, B, tf, live_ok, final=True)
@@ -730,13 +748,6 @@ class Engine:
         if not lag:
             self._try_entry(it, done)
 
-    def _set_signal_status(self, ex, sym, candle, status):
-        """(lock held) change the status of a row in Signals."""
-        for s in reversed(self.state["signals"]):
-            if s.get("exchange") == ex and s.get("symbol") == sym and s.get("candle") == candle:
-                s["status"] = status
-                return
-
     def _skip(self, rec, now, key, why):
         """(lock held) a pattern appeared but we cannot enter -> show it in Signals + Log, never silent."""
         state = self.state
@@ -746,7 +757,7 @@ class Engine:
         add_log(state, now, f"SKIPPED {rec['symbol']}: {why}  ({rec['pattern']})")
         save_state(state)
 
-    def _enter(self, it, rec, ctime, price, now, from_queue=False):
+    def _enter(self, it, rec, ctime, price, now):
         """(lock held) size the position and open it at the live price."""
         cfg, state = self.cfg, self.state
         ex, sym = it["exchange"], it["symbol"]
@@ -772,13 +783,10 @@ class Engine:
                 "stop_loss": round(entry * (1 - cfg.sl_pct / 100), 2) if cfg.sl_pct > 0 else None,
                 "target": round(entry * (1 + cfg.target_pct / 100), 2), "qty": int(qty), "mf": mf, "last_price": price,
                 "last_checked": str(now.floor("min")), **{k: rec[k] for k in CANDLE_KEYS}})
-            rec["status"] = "ENTERED (after waiting)" if from_queue else "ENTERED"
+            rec["status"] = "ENTERED"
             add_log(state, now, f"ENTRY {sym} @ {entry:.2f}  qty {qty}  TGT {entry * (1 + cfg.target_pct / 100):.2f}  "
-                                f"({rec['pattern']}){'  [was waiting for a free position]' if from_queue else ''}")
-        if from_queue:
-            self._set_signal_status(ex, sym, rec["candle"], rec["status"])
-        else:
-            state["signals"] = (state["signals"] + [rec])[-200:]
+                                f"({rec['pattern']})")
+        state["signals"] = (state["signals"] + [rec])[-200:]
         save_state(state)
 
     def _try_entry(self, it, done):
@@ -1104,7 +1112,7 @@ def log_frame(lines, n=100):
     for ln in reversed(lines[-n:]):
         t, _, msg = ln.partition("  ")
         parts = msg.split(" ", 2)
-        if parts[0] in ("ENTRY", "CLOSED", "SKIPPED", "WAITING", "EXPIRED") and len(parts) >= 2:
+        if parts[0] in ("ENTRY", "CLOSED", "SKIPPED") and len(parts) >= 2:
             ev, sym, rest = parts[0], parts[1].rstrip(":"), (parts[2] if len(parts) > 2 else "")
         else:
             ev, sym, rest = "INFO", "", msg
@@ -1112,24 +1120,10 @@ def log_frame(lines, n=100):
     return pd.DataFrame(rows, columns=["time", "event", "symbol", "details"])
 
 
-def render_live(exchange, tf_label):
-    """Everything on the right side. Runs as a fragment: refreshes itself every few seconds, never blocks."""
-    engine = get_engine()
-    snap = engine.snapshot()
+def _frames():
+    """One consistent snapshot + the tables built from it (every fragment calls this)."""
+    snap = get_engine().snapshot()
     state, cfg = snap["state"], snap["cfg"] or Config()
-    now = now_ist()
-    stamp = f"{now:%Y%m%d}"
-    hrs = "9:00-23:30" if exchange == "MCX" else "9:15-15:30"
-    mkt = (f"{exchange} market OPEN" if market_open(now, exchange) else
-           f"{exchange} market CLOSED (entry/exit run {hrs} IST, Mon-Fri)")
-    upd = f"{snap['last_update']:%H:%M:%S}" if snap["last_update"] is not None else "-"
-    st.write(f"**{'RUNNING' if snap['running'] else 'STOPPED'}**  |  {mkt}  |  now {now:%H:%M:%S} IST  |  "
-             f"data updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {cfg.per_position:,.0f}")
-    if snap["running"]:
-        st.caption(f"Engine: {snap['status']}")
-    else:
-        st.info("Exchange + stocks select panni, settings kudutthu **Start** click pannunga. **Stop** na nikkum; trades save aagi irukkum.")
-
     open_df, closed_df = pd.DataFrame(state["open"]), pd.DataFrame(state["closed"])
     if not closed_df.empty:
         old_pat = closed_df["pattern"] if "pattern" in closed_df.columns else [None] * len(closed_df)
@@ -1138,12 +1132,38 @@ def render_live(exchange, tf_label):
                  "exit_time", "exit", "reason", "pnl"]
         closed_df = closed_df[[c for c in order if c in closed_df.columns]].rename(
             columns={"signal_date": "signal_candle_start", "signal_close": "signal_candle_close"})
-    realized = float(closed_df["pnl"].sum()) if not closed_df.empty else 0.0
-    unreal = 0.0
     if not open_df.empty:
         open_df["live_price"] = open_df["last_price"].round(2)
         open_df["PnL"] = ((open_df["last_price"] - open_df["entry"]) * open_df["qty"]).round(2)
-        unreal = float(open_df["PnL"].sum())
+    return snap, state, cfg, open_df, closed_df
+
+
+def _csv_button(label, df, name, key):
+    """Download button under every table - always visible, disabled until the table has data."""
+    empty = df is None or df.empty
+    st.download_button(label, b"" if empty else df.to_csv(index=False).encode(), f"{name}_{now_ist():%Y%m%d}.csv",
+                       "text/csv", key=key, disabled=empty)
+
+
+# The page is split in fragments: price tables refresh every SECOND, the rest (signals, closed trades, logs, CSV
+# buttons) every few seconds - they only change when a candle closes / a trade exits.
+def live_top(exchange, tf_label):
+    """Status line + metrics + 1. Monitoring (live price every second)."""
+    snap, state, cfg, open_df, closed_df = _frames()
+    now = now_ist()
+    hrs = "9:00-23:30" if exchange == "MCX" else "9:15-15:30"
+    mkt = (f"{exchange} market OPEN" if market_open(now, exchange) else
+           f"{exchange} market CLOSED (entry/exit run {hrs} IST, Mon-Fri)")
+    upd = f"{snap['last_update']:%H:%M:%S}" if snap["last_update"] is not None else "-"
+    st.write(f"**{'RUNNING' if snap['running'] else 'STOPPED'}**  |  {mkt}  |  now {now:%H:%M:%S} IST  |  "
+             f"prices updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {cfg.per_position:,.0f}")
+    if snap["running"]:
+        st.caption(f"Engine: {snap['status']}")
+    else:
+        st.info("Exchange + stocks select panni, settings kudutthu **Start** click pannunga. **Stop** na nikkum; trades save aagi irukkum.")
+
+    realized = float(closed_df["pnl"].sum()) if not closed_df.empty else 0.0
+    unreal = float(open_df["PnL"].sum()) if not open_df.empty else 0.0
     win = (closed_df["pnl"] > 0).mean() * 100 if not closed_df.empty else 0.0
     m = st.columns(5)
     m[0].metric("Open positions", f"{len(open_df)} / {'no limit' if cfg.no_limit else cfg.max_open}")
@@ -1152,24 +1172,24 @@ def render_live(exchange, tf_label):
     m[3].metric("Unrealized P&L", f"{unreal:,.0f}")
     m[4].metric("Win rate (closed)", f"{win:.0f}%")
 
-    def csv_button(label, df, name, key):
-        """Download button under every table - always visible, disabled until the table has data."""
-        empty = df is None or df.empty
-        st.download_button(label, b"" if empty else df.to_csv(index=False).encode(), f"{name}_{stamp}.csv",
-                           "text/csv", key=key, disabled=empty)
-
     st.subheader("1. Monitoring - live data + pattern outlook")
     mon_df = pd.DataFrame(snap["rows"])
     if mon_df.empty:
         st.write("Stocks select panni Start pannina, live data + pattern outlook inge varum.")
     else:
-        st.caption(f"open / high / low = running {tf_label or 'timeframe'} candle | prev_close = previous candle close | "
-                   "change_% = ltp vs previous candle close")
+        st.caption(f"ltp = live price (every second) | open / high / low = running {tf_label or 'timeframe'} candle | "
+                   "prev_close = previous candle close | change_% = ltp vs previous candle close | "
+                   "pattern_outlook changes only when a candle closes")
         if mon_df["ltp"].isna().all() and snap["errors"]:
             st.warning("Live price varala: " + " | ".join(snap["errors"][:3]))
         st.dataframe(mon_df, use_container_width=True, hide_index=True,
                      column_config={"pattern_outlook": st.column_config.TextColumn("pattern_outlook", width="large")})
-    csv_button("Download monitoring CSV", mon_df, "monitoring", "dl_monitor")
+
+
+def live_mid():
+    """Monitoring CSV + 2. Signals (changes only when a candle closes)."""
+    snap, state, cfg, open_df, closed_df = _frames()
+    _csv_button("Download monitoring CSV", pd.DataFrame(snap["rows"]), "monitoring", "dl_monitor")
 
     st.subheader("2. Signals")
     sig_df = pd.DataFrame(state["signals"])
@@ -1177,19 +1197,28 @@ def render_live(exchange, tf_label):
         st.write("Signals illa (candle mudiyum bodhu pattern vandha inge varum).")
     else:
         st.dataframe(sig_df.iloc[::-1], use_container_width=True, hide_index=True)       # latest on top
-    csv_button("Download signals CSV", sig_df, "signals", "dl_signals")
+    _csv_button("Download signals CSV", sig_df, "signals", "dl_signals")
     if snap["errors"]:
         with st.expander(f"{len(snap['errors'])} warning(s)"):
             st.write("\n".join(snap["errors"]))
 
+
+def live_positions():
+    """3. Live positions (live price + P&L every second)."""
+    snap, state, cfg, open_df, closed_df = _frames()
     st.subheader("3. Live positions (entry aana, exit-ku wait)")
-    cols = ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL"]
-    cols = [c for c in cols if c in open_df.columns]
+    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL"] if c in open_df.columns]
     if open_df.empty:
         st.write("Open positions illa.")
     else:
         st.dataframe(open_df[cols], use_container_width=True, hide_index=True)
-    csv_button("Download live positions CSV", open_df[cols] if not open_df.empty else open_df, "live_positions", "dl_open")
+
+
+def live_bottom():
+    """Positions CSV + 4. Closed trades + 5. Logs + 6. Excel check (change only on entry / exit)."""
+    snap, state, cfg, open_df, closed_df = _frames()
+    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL"] if c in open_df.columns]
+    _csv_button("Download live positions CSV", open_df[cols] if not open_df.empty else open_df, "live_positions", "dl_open")
 
     st.subheader("4. Closed trades (exit aanadhu)")
     show = ["symbol", "exchange", "pattern", "entry_time", "entry", "exit_time", "exit", "reason", "pnl"]
@@ -1198,7 +1227,7 @@ def render_live(exchange, tf_label):
     else:
         st.dataframe(closed_df[[c for c in show if c in closed_df.columns]].rename(columns={"pnl": "PnL"}).iloc[::-1],
                      use_container_width=True, hide_index=True)                      # latest exit on top
-    csv_button("Download closed trades CSV", closed_df, "closed_trades", "dl_closed")   # CSV also has the 2 candles' OHLC
+    _csv_button("Download closed trades CSV", closed_df, "closed_trades", "dl_closed")   # CSV also has the 2 candles' OHLC
 
     st.subheader("5. Logs")
     log_df = log_frame(state["log"])
@@ -1206,8 +1235,7 @@ def render_live(exchange, tf_label):
         st.write("No events yet.")
     else:
         st.dataframe(log_df, use_container_width=True, hide_index=True)                  # latest on top
-    csv_button("Download logs CSV", log_df, "logs", "dl_log")
-
+    _csv_button("Download logs CSV", log_df, "logs", "dl_log")
 
     st.subheader("6. Excel check - every entry's 2 candles + your 3 formulas")
     check_df = excel_check_frame(state["open"] + state["closed"])
@@ -1217,8 +1245,7 @@ def render_live(exchange, tf_label):
         st.caption("CSV-a Excel-la open pannunga. B=Open, C=High, D=Low, E=Close. F, G, H = unga formulas, I = app sonna pattern. "
                    "F/G/H-la theriyardhum I-layum ore pattern irukkanum.")
         st.dataframe(check_df.iloc[:, :5], use_container_width=True, hide_index=True)
-    csv_button("Download Excel check CSV (open + closed entries)", check_df, "excel_check", "dl_check")
-
+    _csv_button("Download Excel check CSV (open + closed entries)", check_df, "excel_check", "dl_check")
 
 
 def main_page():
@@ -1345,9 +1372,15 @@ def main_page():
             engine.start(engine.smart or smart, cfg, items, exchange, ignore_hours)
     status_ph.write("Status: **RUNNING**" if engine.running else "Status: **STOPPED**")
 
-    # the page itself never waits: the engine works in the background, this block only displays (refresh every 3 s)
+    # the page itself never waits: the engine works in the background, these blocks only display.
+    # price tables refresh every 1 s, signals / closed trades / logs / CSV buttons every 3 s
     frag = getattr(st, "fragment", None) or st.experimental_fragment
-    frag(run_every=3 if engine.running else None)(render_live)(exchange, tf_label)
+    fast = 1 if engine.running else None
+    slow = 3 if engine.running else None
+    frag(run_every=fast)(live_top)(exchange, tf_label)
+    frag(run_every=slow)(live_mid)()
+    frag(run_every=fast)(live_positions)()
+    frag(run_every=slow)(live_bottom)()
 
 
 # ============================== ENTRY ==============================
