@@ -1132,9 +1132,11 @@ def _frames():
                  "exit_time", "exit", "reason", "pnl"]
         closed_df = closed_df[[c for c in order if c in closed_df.columns]].rename(
             columns={"signal_date": "signal_candle_start", "signal_close": "signal_candle_close"})
+        closed_df["pnl_%"] = ((closed_df["exit"] / closed_df["entry"] - 1) * 100).round(2)
     if not open_df.empty:
         open_df["live_price"] = open_df["last_price"].round(2)
         open_df["PnL"] = ((open_df["last_price"] - open_df["entry"]) * open_df["qty"]).round(2)
+        open_df["PnL_%"] = ((open_df["last_price"] / open_df["entry"] - 1) * 100).round(2)
     return snap, state, cfg, open_df, closed_df
 
 
@@ -1169,7 +1171,8 @@ def live_top(exchange, tf_label):
     m[0].metric("Open positions", f"{len(open_df)} / {'no limit' if cfg.no_limit else cfg.max_open}")
     m[1].metric("Closed trades", len(closed_df))
     m[2].metric("Realized P&L", f"{realized:,.0f}")
-    m[3].metric("Unrealized P&L", f"{unreal:,.0f}")
+    invested = float((open_df["entry"] * open_df["qty"]).sum()) if not open_df.empty else 0.0
+    m[3].metric("Unrealized P&L", f"{unreal:,.0f}", f"{unreal / invested * 100:.2f}%" if invested else None)
     m[4].metric("Win rate (closed)", f"{win:.0f}%")
 
     st.subheader("1. Monitoring - live data + pattern outlook")
@@ -1207,7 +1210,7 @@ def live_positions():
     """3. Live positions (live price + P&L every second)."""
     snap, state, cfg, open_df, closed_df = _frames()
     st.subheader("3. Live positions (entry aana, exit-ku wait)")
-    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL"] if c in open_df.columns]
+    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
     if open_df.empty:
         st.write("Open positions illa.")
     else:
@@ -1217,11 +1220,11 @@ def live_positions():
 def live_bottom():
     """Positions CSV + 4. Closed trades + 5. Logs + 6. Excel check (change only on entry / exit)."""
     snap, state, cfg, open_df, closed_df = _frames()
-    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL"] if c in open_df.columns]
+    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
     _csv_button("Download live positions CSV", open_df[cols] if not open_df.empty else open_df, "live_positions", "dl_open")
 
     st.subheader("4. Closed trades (exit aanadhu)")
-    show = ["symbol", "exchange", "pattern", "entry_time", "entry", "exit_time", "exit", "reason", "pnl"]
+    show = ["symbol", "exchange", "pattern", "entry_time", "entry", "exit_time", "exit", "reason", "pnl", "pnl_%"]
     if closed_df.empty:
         st.write("Closed trades illa.")
     else:
