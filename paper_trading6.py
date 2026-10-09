@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import math
@@ -367,6 +368,7 @@ def load_state(path=STATE_FILE):
     s = json.load(open(path)) if os.path.exists(path) else {}
     for k in ("open", "closed", "handled", "log", "signals"):
         s.setdefault(k, [])
+    s["_path"] = path                                   # which user's file this state belongs to (not saved inside the file)
     s.pop("waiting", None)                              # old versions had a waiting queue - gone now
     for g in s["signals"]:
         if str(g.get("status", "")).startswith(("WAITING", "EXPIRED")):
@@ -374,9 +376,10 @@ def load_state(path=STATE_FILE):
     return s
 
 
-def save_state(state, path=STATE_FILE):
+def save_state(state, path=None):
+    path = path or state.get("_path", STATE_FILE)
     with open(path, "w") as f:
-        json.dump(state, f, indent=1, default=str)
+        json.dump({k: v for k, v in state.items() if not k.startswith("_")}, f, indent=1, default=str)
 
 
 def add_log(state, now, msg):
@@ -467,6 +470,9 @@ def candle_boundary(now, exchange, tf_min):
     return start + ((now - start) // step) * step
 
 
+OWNER_ID = "owner"
+
+
 class Engine:
     """Does all the Angel One work in a background thread, so the page never waits.
        - candles are downloaded ONCE per new candle (not every refresh)
@@ -476,12 +482,19 @@ class Engine:
     EXIT_EVERY = 15      # seconds between target / SL checks
     QUOTE_EVERY = 1.0    # seconds between live price updates (every table that shows a price)
 
-    def __init__(self):
+    def __init__(self, uid=OWNER_ID):
+        self.uid = uid
+        if uid == OWNER_ID:                                   # owner keeps the old file names
+            self.state_file, self.run_file = STATE_FILE, RUN_CONFIG_FILE
+        else:                                                 # every approved user gets a private folder
+            d = os.path.join("users", uid)
+            os.makedirs(d, exist_ok=True)
+            self.state_file, self.run_file = os.path.join(d, "live_state.json"), os.path.join(d, "run_config.json")
         self.lock = threading.RLock()
         self.thread = None
         self.stop_evt = threading.Event()
         self.qthread = None
-        self.state = load_state()
+        self.state = load_state(self.state_file)
         self.smart = self.cfg = None
         self.creds, self.client_id, self.login_time = None, "", 0.0   # kept in memory only (for the daily re-login)
         self.items, self.exchange, self.ignore = [], "NSE", False
@@ -505,7 +518,7 @@ class Engine:
             return
         try:
             from dataclasses import asdict
-            with open(RUN_CONFIG_FILE, "w") as f:
+            with open(self.run_file, "w") as f:
                 json.dump({"running": running, "exchange": self.exchange, "ignore": self.ignore,
                            "items": self.items, "cfg": asdict(self.cfg)}, f, default=str)
         except Exception:
@@ -514,9 +527,9 @@ class Engine:
     def try_autoresume(self):
         """After a restart (PC reboot, crash): log in with the ANGEL_* environment variables and carry on."""
         try:
-            if not os.path.exists(RUN_CONFIG_FILE):
+            if not os.path.exists(self.run_file):
                 return
-            rc = json.load(open(RUN_CONFIG_FILE))
+            rc = json.load(open(self.run_file))
             creds = env_creds()
             if not rc.get("running") or not creds:
                 return
@@ -560,9 +573,9 @@ class Engine:
     def reset_all(self):
         self.stop()
         with self.lock:
-            if os.path.exists(STATE_FILE):
-                os.remove(STATE_FILE)
-            self.state = load_state()
+            if os.path.exists(self.state_file):
+                os.remove(self.state_file)
+            self.state = load_state(self.state_file)
             self._clear_runtime()
 
     def close_now(self, key):
@@ -894,10 +907,45 @@ def env_creds():
     return None
 
 
+def owner_email():
+    """Only this email may use the server-saved Angel login (ANGEL_* env / secrets [angel]) and auto-resume.
+       Set OWNER_EMAIL (environment) or [access_control] owner_email (secrets)."""
+    v = os.getenv("OWNER_EMAIL", "").strip().lower()
+    if not v:
+        try:
+            v = str(st.secrets["access_control"]["owner_email"]).strip().lower()
+        except Exception:
+            v = ""
+    return v
+
+
+def current_uid():
+    """Who is this browser? The approved email from the access gate -> its own private id."""
+    em = (st.session_state.get("access_email") or "").strip().lower()
+    if not em:
+        return None
+    if em == owner_email():
+        return OWNER_ID
+    return "u_" + hashlib.sha256(em.encode()).hexdigest()[:16]
+
+
 @st.cache_resource
-def get_engine():
-    eng = Engine()
-    threading.Thread(target=eng.try_autoresume, daemon=True).start()      # no waiting for the page
+def _engines():
+    return {"lock": threading.Lock(), "map": {}}
+
+
+def get_engine(uid=None):
+    """THIS user's engine (own trades, own Angel login, own running loop). Created on first use."""
+    uid = uid or current_uid()
+    if not uid:
+        raise RuntimeError("No approved user in this session")
+    reg = _engines()
+    with reg["lock"]:
+        eng = reg["map"].get(uid)
+        if eng is None:
+            eng = reg["map"][uid] = Engine(uid)
+            if uid == OWNER_ID:                                   # only the owner can auto-resume (his login is saved on the server)
+                threading.Thread(target=eng.try_autoresume, daemon=True).start()
     return eng
 
 
@@ -1107,14 +1155,18 @@ def access_gate():
 # ============================== UI ==============================
 def login_page():
     no_dim()
+    if env_creds() and not owner_email():
+        st.warning("Server-la Angel login (ANGEL_*) save aagi irukku, aanaa OWNER_EMAIL set pannala, so auto login "
+                   "yaarukum work aagaadhu. OWNER_EMAIL (illa secrets [access_control] owner_email) set pannunga.")
     page = st.empty()
     with page.container():
         st.title("Angel One Login")
         st.caption("Credentials are used only for this session. Nothing is saved to disk. "
                    "Never share your TOTP secret with anyone.")
         with st.form("login"):
-            api_key = st.text_input("API Key", value=os.getenv("ANGEL_API_KEY", ""))
-            client_id = st.text_input("Client ID", value=os.getenv("ANGEL_CLIENT_ID", ""))
+            mine = current_uid() == OWNER_ID                       # pre-fill only for the owner
+            api_key = st.text_input("API Key", value=os.getenv("ANGEL_API_KEY", "") if mine else "")
+            client_id = st.text_input("Client ID", value=os.getenv("ANGEL_CLIENT_ID", "") if mine else "")
             mpin = st.text_input("MPIN", type="password")
             totp_secret = st.text_input("TOTP Secret Key", type="password")
             go = st.form_submit_button("Connect", type="primary")
@@ -1470,7 +1522,7 @@ if "smart" not in _ss and _eng.smart is not None:        # the server is already
     _ss.smart = _eng.smart
     _ss.client_id = _eng.client_id or "connected"
 
-if "smart" not in _ss and not _ss.get("no_autologin"):   # login saved on the server (ANGEL_* env / secrets [angel])
+if "smart" not in _ss and not _ss.get("no_autologin") and current_uid() == OWNER_ID:   # server-saved login: OWNER only
     _creds = env_creds()
     if _creds:
         with st.spinner("Angel One login..."):
