@@ -368,6 +368,7 @@ def load_state(path=STATE_FILE):
     s = json.load(open(path)) if os.path.exists(path) else {}
     for k in ("open", "closed", "handled", "log", "signals"):
         s.setdefault(k, [])
+    s.setdefault("slot_last", {})                       # position number -> the trade that last left it
     s["_path"] = path                                   # which user's file this state belongs to (not saved inside the file)
     s.pop("waiting", None)                              # old versions had a waiting queue - gone now
     for g in s["signals"]:
@@ -385,6 +386,35 @@ def save_state(state, path=None):
 def add_log(state, now, msg):
     state["log"].append(f"{pd.Timestamp(now):%Y-%m-%d %H:%M:%S}  {msg}")
     state["log"] = state["log"][-200:]
+
+
+def _fill_slots(state):
+    """Position numbers (#1, #2 ...). Open trades from older saves have none -> give them the lowest free numbers."""
+    used = {p["slot"] for p in state["open"] if p.get("slot")}
+    for p in sorted([p for p in state["open"] if not p.get("slot")], key=lambda p: str(p.get("entry_time"))):
+        n = 1
+        while n in used:
+            n += 1
+        p["slot"] = n
+        used.add(n)
+
+
+def _pick_slot(state, now):
+    """Position number for a new entry + the trade that left that number earlier today (or None).
+       Oldest exit is refilled first: the first new entry takes the place of the first trade that exited."""
+    _fill_slots(state)
+    used = {p["slot"] for p in state["open"]}
+    today = f"{pd.Timestamp(now):%Y-%m-%d}"
+    last = state.setdefault("slot_last", {})
+    fresh = [(str(v.get("exit_time", "")), int(k)) for k, v in last.items()
+             if int(k) not in used and str(v.get("exit_time", ""))[:10] == today]
+    if fresh:
+        slot = min(fresh)[1]
+        return slot, last[str(slot)]
+    n = 1
+    while n in used:
+        n += 1
+    return n, None
 
 
 
@@ -430,9 +460,16 @@ def _close(state, cfg, pos, raw_px, when, reason):
     done.update({k: pos[k] for k in CANDLE_KEYS + ("signal_close",) if k in pos})
     done.update({"exit_time": str(pd.Timestamp(when).floor("s")), "exit": round(exit_px, 2), "reason": reason,
                  "pnl": round(pnl, 2), "r_multiple": round(pnl / risk, 2) if risk > 0 else None})
+    _fill_slots(state)
+    slot = pos.get("slot")
+    done["slot"] = slot
     state["closed"].append(done)
     state["open"] = [p for p in state["open"] if p is not pos]
-    add_log(state, when, f"CLOSED {pos['symbol']} @ {exit_px:.2f}  {reason}  P&L {pnl:,.2f}")
+    if slot:
+        state.setdefault("slot_last", {})[str(slot)] = {"symbol": pos["symbol"], "reason": reason,
+                                                        "exit_time": done["exit_time"]}
+    add_log(state, when, f"CLOSED {pos['symbol']} @ {exit_px:.2f}  {reason}  P&L {pnl:,.2f}"
+                         f"{f'  (position #{slot} is free now)' if slot else ''}")
 
 
 def check_exits(state, cfg, now, bars_fn, ignore_hours=False):
@@ -819,7 +856,9 @@ class Engine:
                                 f"{f' x margin {mf * 100:g}%' if mf < 1 else ''}) but amount per position is "
                                 f"{cfg.per_position:,.0f}, free cash {cash:,.0f}")
         else:
+            slot, replaced = _pick_slot(state, now)
             state["open"].append({
+                "slot": slot,
                 "symbol": sym, "tradingsymbol": it["tradingsymbol"], "token": it["token"], "exchange": ex,
                 "pattern": rec["pattern"], "signal_date": str(ctime), "signal_close": str(ctime + tf),
                 "entry_time": str(now.floor("s")),
@@ -828,8 +867,11 @@ class Engine:
                 "target": round(entry * (1 + cfg.target_pct / 100), 2), "qty": int(qty), "mf": mf, "last_price": price,
                 "last_checked": str(now.floor("min")), **{k: rec[k] for k in CANDLE_KEYS}})
             rec["status"] = "ENTERED"
+            where = f"position #{slot}" + ("" if cfg.no_limit else f"/{cfg.max_open}")
+            if replaced:
+                where += f", took the place of {replaced['symbol']} ({replaced['reason']} {str(replaced['exit_time'])[11:]})"
             add_log(state, now, f"ENTRY {sym} @ {entry:.2f}  qty {qty}  TGT {entry * (1 + cfg.target_pct / 100):.2f}  "
-                                f"({rec['pattern']})")
+                                f"({rec['pattern']})  -> {where}")
         state["signals"] = (state["signals"] + [rec])[-200:]
         save_state(state)
 
@@ -1236,12 +1278,14 @@ def _frames():
     if not closed_df.empty:
         old_pat = closed_df["pattern"] if "pattern" in closed_df.columns else [None] * len(closed_df)
         closed_df["pattern"] = [classify_candles(r) or p for r, p in zip(closed_df.to_dict("records"), old_pat)]
-        order = ["symbol", "exchange", "signal_date", "signal_close", *CANDLE_KEYS, "pattern", "entry_time", "entry", "qty",
+        order = ["slot", "symbol", "exchange", "signal_date", "signal_close", *CANDLE_KEYS, "pattern", "entry_time", "entry", "qty",
                  "exit_time", "exit", "reason", "pnl", "r_multiple"]
         closed_df = closed_df[[c for c in order if c in closed_df.columns]].rename(
-            columns={"signal_date": "signal_candle_start", "signal_close": "signal_candle_close"})
+            columns={"slot": "position", "signal_date": "signal_candle_start", "signal_close": "signal_candle_close"})
         closed_df["pnl_%"] = ((closed_df["exit"] / closed_df["entry"] - 1) * 100).round(2)
     if not open_df.empty:
+        _fill_slots(state)
+        open_df = pd.DataFrame(state["open"]).rename(columns={"slot": "position"}).sort_values("position")
         open_df["live_price"] = open_df["last_price"].round(2)
         open_df["PnL"] = ((open_df["last_price"] - open_df["entry"]) * open_df["qty"]).round(2)
         open_df["PnL_%"] = ((open_df["last_price"] / open_df["entry"] - 1) * 100).round(2)
@@ -1321,7 +1365,7 @@ def live_positions():
     """3. Live positions (live price + P&L every second)."""
     snap, state, cfg, open_df, closed_df = _frames()
     st.subheader("3. Live positions (entry aana, exit-ku wait)")
-    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
+    cols = [c for c in ["position", "symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
     if open_df.empty:
         st.write("Open positions illa.")
     else:
@@ -1331,11 +1375,11 @@ def live_positions():
 def live_bottom():
     """Positions CSV + 4. Closed trades + 5. Logs + 6. Excel check (change only on entry / exit)."""
     snap, state, cfg, open_df, closed_df = _frames()
-    cols = [c for c in ["symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
+    cols = [c for c in ["position", "symbol", "exchange", "pattern", "entry_time", "entry", "live_price", "PnL", "PnL_%"] if c in open_df.columns]
     _csv_button("Download live positions CSV", open_df[cols] if not open_df.empty else open_df, "live_positions", "dl_open")
 
     st.subheader("4. Closed trades (exit aanadhu)")
-    show = ["symbol", "exchange", "pattern", "entry_time", "entry", "qty", "exit_time", "exit", "reason", "pnl", "pnl_%",
+    show = ["position", "symbol", "exchange", "pattern", "entry_time", "entry", "qty", "exit_time", "exit", "reason", "pnl", "pnl_%",
             "r_multiple"]
     if closed_df.empty:
         st.write("Closed trades illa.")
